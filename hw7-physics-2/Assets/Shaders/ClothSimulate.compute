@@ -1,0 +1,228 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Init
+#pragma kernel Step
+
+#define THREAD_X 8
+#define THREAD_Y 8
+
+//顶点位置
+RWStructuredBuffer<float3> positions;
+//顶点速度
+RWStructuredBuffer<float3> velocities;
+
+//x表示横向顶点数量,y表示纵向顶点数量,z = x * y
+uniform uint3 size;
+//弹性系数.xyz分别对应结构弹簧、剪力弹簧、弯曲弹簧
+uniform float3 springKs;
+//弹簧原长.xyz分别对应结构弹簧、剪力弹簧、弯曲弹簧
+uniform float3 restLengths;
+//单个顶点的质量
+uniform float mass;
+//单次迭代时间间隔
+uniform float dt;
+//重力加速度
+uniform float gravity;
+//阻尼
+uniform float drag;
+//碰撞球球心
+uniform float3 spherePos;
+//碰撞球半径
+uniform float sphereRadius;
+//碰撞球阻力系数
+uniform float sphereDrag;
+//使用半隐式欧拉或隐式欧拉
+uniform bool useImplicitEuler;
+
+//根据线程ID，获取对应顶点的索引
+static uint getIndex(uint2 id) {
+    return id.y * size.x + id.x;
+}
+//获取指定索引的顶点位置
+static float3 getPosition(uint index) {
+    return positions[index].xyz;
+}
+//获取指定线程ID的顶点位置
+static float3 getPosition(uint2 id) {
+    return positions[getIndex(id)].xyz;
+}
+//获取指定索引的顶点速度
+static float3 getVelocity(uint index) {
+    return velocities[index];
+}
+//设置速度
+static void setVelocity(uint index, float3 vel) {
+    velocities[index] = vel;
+}
+//设置位置
+static void setPosition(uint index, float3 pos) {
+    positions[index] = pos;
+}
+//判断索引是否可用
+static bool isValidateId(uint2 id) {
+    return id.x >= 0 && id.x < size.x && id.y >= 0 && id.y < size.y;
+}
+
+//计算弹性力
+static float3 calcSpringF(float3 position, uint2 idOther, float ks, float l) {
+    if (!isValidateId(idOther)) return float3(0, 0, 0);
+    float3 otherPos = getPosition(idOther);
+    float dist = distance(position, otherPos);
+    float3 dir = normalize(otherPos - position);
+    return (dist - l) * ks * dir;
+}
+
+//计算与小球的碰撞力
+static float3 collisionDetect(float3 position) {
+    float dist = distance(position, spherePos);
+    //为防止穿模，碰撞检测半径适当扩大
+    float collisionRadius = sphereRadius * 1.05f;
+    if (dist < collisionRadius) {
+        return normalize(position - spherePos) * (collisionRadius - dist) * sphereDrag;
+    } else {
+        return float3(0, 0, 0);
+    }
+}
+
+// 计算3x3矩阵的逆矩阵
+ float3x3 inverse(in float3x3 mat)
+ {
+     float3 cross1 = cross(mat[1], mat[2]);
+     float3 cross2 = cross(mat[2], mat[0]);
+     float3 cross3 = cross(mat[0], mat[1]);
+     float det = dot(mat[0], cross1);
+     float3x3 adjugate = transpose(float3x3(cross1, cross2, cross3));
+     return adjugate / det;
+ }
+
+//计算质点受力
+static float3 calculateF(uint2 id, float3 position, float3 velocity) {
+    float3 f = float3(0, 0, 0);
+    
+    //TODO:计算重力
+    f.y -= gravity * mass;
+
+    //TODO:计算弹性力
+    //结构力
+    f += calcSpringF(position, uint2(id.x - 1, id.y), springKs.x, restLengths.x);
+    f += calcSpringF(position, uint2(id.x + 1, id.y), springKs.x, restLengths.x);
+    f += calcSpringF(position, uint2(id.x, id.y - 1), springKs.x, restLengths.x);
+    f += calcSpringF(position, uint2(id.x, id.y + 1), springKs.x, restLengths.x);
+    //剪力
+    f += calcSpringF(position, uint2(id.x - 1, id.y - 1), springKs.y, restLengths.y);
+    f += calcSpringF(position, uint2(id.x - 1, id.y + 1), springKs.y, restLengths.y);
+    f += calcSpringF(position, uint2(id.x + 1, id.y + 1), springKs.y, restLengths.y);
+    f += calcSpringF(position, uint2(id.x + 1, id.y - 1), springKs.y, restLengths.y);
+    //弯曲力
+    f += calcSpringF(position, uint2(id.x - 2, id.y), springKs.z, restLengths.z);
+    f += calcSpringF(position, uint2(id.x + 2, id.y), springKs.z, restLengths.z);
+    f += calcSpringF(position, uint2(id.x, id.y - 2), springKs.z, restLengths.z);
+    f += calcSpringF(position, uint2(id.x, id.y + 2), springKs.z, restLengths.z);
+
+    //TODO:计算阻尼力
+    f -= velocity * drag;
+
+    //计算与小球的碰撞力
+    f += collisionDetect(position);
+
+    return f;
+}
+
+//半隐式欧拉
+static void semiImplicitEuler(uint2 id, int index) {
+    float3 position = getPosition(index);
+    float3 velocity = getVelocity(index);
+
+    //计算受力和加速度
+    float3 force = calculateF(id, position, velocity);
+    float3 a = force / mass;
+
+    //更新速度
+    float3 newVelocity = velocity + a * dt;
+    setVelocity(index, newVelocity);
+
+    //更新位置
+    float3 newPosition = position + newVelocity * dt;
+    setPosition(index, newPosition);
+}
+
+//隐式欧拉
+static void implicitEuler(uint2 id, int index) {
+    float3 position = getPosition(index);
+    float3 velocity = getVelocity(index);
+
+    float3 newPosition, newVelocity;
+    float h = 1e-4;
+    float halfH = h / 2;
+
+    //隐式欧拉方法需要求解以下隐式方程
+    //newPosition == position + dt * (calculateF(id, newPosition, velocity) / mass * dt + velocity)
+    //使用牛顿迭代法求解，最大迭代次数为6
+    float3 tmpPosition = position + velocity * dt;
+    
+    for (int i = 0; i < 6; i++) {
+        //计算受力和加速度
+        float3 force = calculateF(id, tmpPosition, velocity);
+        float3 a = force / mass;
+
+        //更新速度
+        newVelocity = velocity + a * dt;
+
+        //更新位置
+        newPosition = position + newVelocity * dt;
+        
+        float3 a1, a2;
+        //使用中心差商代替速度关于位置的导数值
+        //x方向偏导
+        a1 = calculateF(id, position + float3(halfH, 0, 0), velocity) / mass;
+        a2 = calculateF(id, position - float3(halfH, 0, 0), velocity) / mass;
+        float3 d1 = (a1 - a2) * dt / h;
+        //y方向偏导
+        a1 = calculateF(id, position + float3(0, halfH, 0), velocity) / mass;
+        a2 = calculateF(id, position - float3(0, halfH, 0), velocity) / mass;
+        float3 d2 = (a1 - a2) * dt / h;
+        //z方向偏导
+        a1 = calculateF(id, position + float3(0, 0, halfH), velocity) / mass;
+        a2 = calculateF(id, position - float3(0, 0, halfH), velocity) / mass;
+        float3 d3 = (a1 - a2) * dt / h;
+        
+        //雅可比矩阵
+        float3x3 e = float3x3(float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1));
+        float3x3 j = e - float3x3(d1, d2, d3) * dt;
+        float3x3 j_inv = inverse(j);
+        
+        //差值
+        float3 diff = tmpPosition - newPosition;
+        //达到阈值后停止迭代
+        if (length(diff) < h) break;
+        
+        //求下一次迭代结果
+        tmpPosition = tmpPosition - mul(j_inv, diff);
+    }
+
+    setVelocity(index, newVelocity);
+    setPosition(index, newPosition);
+}
+
+[numthreads(THREAD_X, THREAD_Y, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    //初始化顶点位置和速度
+    uint index = getIndex(id.xy);
+    positions[index] = float3(id.x * restLengths.x, 0, id.y * restLengths.x);
+    velocities[index] = float3(0, 0, 0);
+}
+
+[numthreads(THREAD_X, THREAD_Y, 1)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    //固定两个顶点
+    if (id.y == 0 && (id.x == 0 || id.x == size.x - 1)) {
+        return;
+    }
+
+    float index = getIndex(id.xy);
+
+    if (useImplicitEuler) implicitEuler(id.xy, index);
+    else semiImplicitEuler(id.xy, index);
+}
+
